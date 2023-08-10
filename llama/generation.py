@@ -43,9 +43,10 @@ Dialog = List[Message]
 
 B_INST, E_INST = "[INST]", "[/INST]"
 B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+DEFAULT_SYSTEM_PROMPT = """\
+You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
 
-SPECIAL_TAGS = [B_INST, E_INST, "<<SYS>>", "<</SYS>>"]
-UNSAFE_ERROR = "Error: special tags are not allowed as part of the prompt."
+If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information."""
 
 
 class Llama:
@@ -116,23 +117,60 @@ class Llama:
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
-        min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
+        min_prompt_len = min(len(t) for t in prompt_tokens) # =8
+        max_prompt_len = max(len(t) for t in prompt_tokens) # =51
         assert max_prompt_len <= params.max_seq_len
-        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len) # =115
 
+        # pad_id = -1
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        # (bsz, max_seq_len)全尺寸的1， （4，128）的tensor，value=1
+#         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, params.max_seq_len), 1, dtype=torch.long, device="cuda")
+        # 把tokens的数值放到1的矩阵里，没有词的地方保持1
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
+
         prev_pos = 0
+        # [False, False, False, False]
         eos_reached = torch.tensor([False] * bsz, device="cuda")
-        input_text_mask = tokens != pad_id
+        # 有词的地方True，没词的地方False,用于更长的batch在前几次算短batch的时候不换词
+        input_text_mask = tokens != 1
+        # pad的是1,和BOS一样，所以要把开头再重新设成True
+        input_text_mask[:, 0] = True
+
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            #只传有词的部分
+#             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits_temp = self.model.forward(tokens, prev_pos, cur_pos)
+            # 去掉改定长padding的部分
+            logits = logits_temp[:, :cur_pos - prev_pos, :]
+
+            #############
+            # Exportng PyTorch model to the ONNX one
+            try:
+                torch.onnx.export(self.model,               # model being run
+                                # model input (or a tuple for multiple inputs)
+                                (tokens, prev_pos, cur_pos),
+                                # where to save the model (can be a file or file-like object)
+                                "llama2.onnx",
+                                export_params=False,        # store the trained parameter weights inside the model file
+                                opset_version=14,          # the ONNX version to export the model to
+                                do_constant_folding=True,  # whether to execute constant folding for optimization
+                                # the model's input names
+                                input_names=['tokens', 'prev_pos', 'cur_pos'],
+                                # the model's output names
+                                output_names=['output']
+                                #   dynamic_axes={'input' : {0 : 'batch_size'},    # variable length axes
+                                #                 'output' : {0 : 'batch_size'}})
+                                )
+                print(f'EXPORTING SUCCESS - ONNX model has been saved to: llama2.onnx')
+            except Exception as e:
+                print(f'EXPORTING FAILED - {e}')
+
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
@@ -147,15 +185,23 @@ class Llama:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
             next_token = next_token.reshape(-1)
+
             # only replace token if prompt has already been generated
+            # torch.where(condition, input, other) condition True的时候用input，False用other
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
+
             tokens[:, cur_pos] = next_token
+            print(next_token)
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
+            # count_temp += 1
+            # if count_temp >1 :
+            #     break
+            sys.exit()
             if all(eos_reached):
                 break
 
@@ -189,7 +235,9 @@ class Llama:
     ) -> List[CompletionPrediction]:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
+        # prompt_tokens是一个list，里面有4个list，size分别是每个Input+1, 最长的是51
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
@@ -198,6 +246,7 @@ class Llama:
             logprobs=logprobs,
             echo=echo,
         )
+        # logprobs一直是False，下面这个if没有调用过
         if logprobs:
             return [
                 {
@@ -220,21 +269,23 @@ class Llama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = []
-        unsafe_requests = []
         for dialog in dialogs:
-            unsafe_requests.append(
-                any([tag in msg["content"] for tag in SPECIAL_TAGS for msg in dialog])
-            )
-            if dialog[0]["role"] == "system":
+            if dialog[0]["role"] != "system":
                 dialog = [
                     {
-                        "role": dialog[1]["role"],
-                        "content": B_SYS
-                        + dialog[0]["content"]
-                        + E_SYS
-                        + dialog[1]["content"],
+                        "role": "system",
+                        "content": DEFAULT_SYSTEM_PROMPT,
                     }
-                ] + dialog[2:]
+                ] + dialog
+            dialog = [
+                {
+                    "role": dialog[1]["role"],
+                    "content": B_SYS
+                    + dialog[0]["content"]
+                    + E_SYS
+                    + dialog[1]["content"],
+                }
+            ] + dialog[2:]
             assert all([msg["role"] == "user" for msg in dialog[::2]]) and all(
                 [msg["role"] == "assistant" for msg in dialog[1::2]]
             ), (
@@ -277,25 +328,16 @@ class Llama:
                 {
                     "generation": {
                         "role": "assistant",
-                        "content": self.tokenizer.decode(t)
-                        if not unsafe
-                        else UNSAFE_ERROR,
+                        "content": self.tokenizer.decode(t),
                     },
                     "tokens": [self.tokenizer.decode(x) for x in t],
                     "logprobs": logprobs_i,
                 }
-                for t, logprobs_i, unsafe in zip(
-                    generation_tokens, generation_logprobs, unsafe_requests
-                )
+                for t, logprobs_i in zip(generation_tokens, generation_logprobs)
             ]
         return [
-            {
-                "generation": {
-                    "role": "assistant",
-                    "content": self.tokenizer.decode(t) if not unsafe else UNSAFE_ERROR,
-                }
-            }
-            for t, unsafe in zip(generation_tokens, unsafe_requests)
+            {"generation": {"role": "assistant", "content": self.tokenizer.decode(t)}}
+            for t in generation_tokens
         ]
 
 

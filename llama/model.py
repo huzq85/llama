@@ -14,6 +14,7 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
 )
 from torch import nn
+import sys
 
 
 @dataclass
@@ -49,16 +50,19 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    # freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    # freqs_cs = torch.view_as_real(freqs_cis)    # type: float
+    freqs_cis = torch.stack([torch.cos(freqs), torch.sin(freqs)], dim=-1)
     return freqs_cis
 
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+
+def compute_float_as_cplx(x: torch.Tensor, freqs_cis: torch.Tensor):
+    # A naive implementation
+    temp1 = x[:,:,:,:,0] * freqs_cis[:,:,:,:,0] - x[:,:,:,:,1] * freqs_cis[:,:,:,:,1]
+    temp2 = x[:,:,:,:,0] * freqs_cis[:,:,:,:,1] + x[:,:,:,:,1] * freqs_cis[:,:,:,:,0]
+    out = torch.stack((temp1, temp2), dim=-1).flatten(3)
+    return out
 
 
 def apply_rotary_emb(
@@ -66,11 +70,14 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 2)
+    shape = [d if i == 1 or i >= xq_.ndim - 2 else 1 for i, d in enumerate(xq_.shape)]
+    freqs_cis = freqs_cis.view(*shape)
+    xq_out = compute_float_as_cplx(xq_, freqs_cis)
+    xk_out = compute_float_as_cplx(xk_, freqs_cis)
+
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -95,6 +102,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.max_seq_len = args.max_seq_len
 
         self.wq = ColumnParallelLinear(
             args.dim,
@@ -155,31 +163,43 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
+        # print('xq before:', xq[0,8,0,0:5])
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
+        # print('xq after:', xq[0,8,0,0:5])
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+#         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+#         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+        # 防止cache的矩阵size溢出，xk矩阵的后面部分本来算的也是虚假的cache
+        self.cache_k[:bsz, start_pos : ] = xk[:bsz, :self.max_seq_len - start_pos]
+        self.cache_v[:bsz, start_pos : ] = xv[:bsz, :self.max_seq_len - start_pos]
+        
 
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+#         keys = self.cache_k[:bsz, : start_pos + seqlen]
+#         values = self.cache_v[:bsz, : start_pos + seqlen]
+        # 需要保存:bsz，以免batch个数不同
+        keys = self.cache_k[:bsz, : ]
+        values = self.cache_v[:bsz, : ]
 
         # repeat k/v heads if n_kv_heads < n_heads
+        # 在text generation里面没有用到repeat_kv
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
+
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)    
+  
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
         return self.wo(output)
 
 
@@ -209,7 +229,9 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        output = self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return output
+
 
 
 class TransformerBlock(nn.Module):
@@ -268,11 +290,15 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
-        _bsz, seqlen = tokens.shape
+    def forward(self, tokens: torch.Tensor, start_pos: int, cur_pos: int):
+        _bsz, seqlen = tokens.shape     # 4,128
+
+        # embedding之后的input (4,128,4096), 注意为了让h可以被embedding, 从padding-1变成了padding1
         h = self.tok_embeddings(tokens)
+
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+#        freqs_cis = self.freqs_cis[ : seqlen]
 
         mask = None
         if seqlen > 1:
@@ -280,9 +306,15 @@ class Transformer(nn.Module):
                 (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
             )
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+            mask[:, :, :, cur_pos:] = float("-inf")
+            mask[:, :, cur_pos:, :] = float("-inf")
+            for ii in range(seqlen):
+                mask[:,:,ii,ii] = 0
+
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+
         h = self.norm(h)
         output = self.output(h).float()
         return output
